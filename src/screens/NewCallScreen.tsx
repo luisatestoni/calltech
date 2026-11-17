@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import * as Location from 'expo-location';
+import * as Notifications from 'expo-notifications';
 import {
   Alert,
   Image,
@@ -11,14 +12,41 @@ import {
   View,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { db, ALUNO_ID } from '../firebase/config';
+
+type PrioridadeSla = 'urgente' | 'normal' | 'baixa';
+
+const SLA_OPCOES: Record<
+  PrioridadeSla,
+  { label: string; detalhe: string; duracaoMs: number; antecedenciaMs: number }
+> = {
+  urgente: {
+    label: 'Urgente',
+    detalhe: 'SLA 2 min (aviso 1 min antes)',
+    duracaoMs: 2 * 60 * 1000,
+    antecedenciaMs: 60 * 1000,
+  },
+  normal: {
+    label: 'Normal',
+    detalhe: 'SLA 1h (aviso 15 min antes)',
+    duracaoMs: 60 * 60 * 1000,
+    antecedenciaMs: 15 * 60 * 1000,
+  },
+  baixa: {
+    label: 'Baixa',
+    detalhe: 'SLA 4h (aviso 30 min antes)',
+    duracaoMs: 4 * 60 * 60 * 1000,
+    antecedenciaMs: 30 * 60 * 1000,
+  },
+};
 
 export default function NewCallScreen({ navigation }: any) {
   // Estados
   const [description, setDescription] = useState('');
   const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [address, setAddress] = useState<string | null>(null);
+  const [prioridade, setPrioridade] = useState<PrioridadeSla>('normal');
   const [loadingLocation, setLoadingLocation] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -102,23 +130,92 @@ export default function NewCallScreen({ navigation }: any) {
     }
   }
 
+  // Agenda notificação local para avisar quando o prazo de SLA estiver se esgotando
+  async function agendarNotificacaoSla(
+    chamadoId: string,
+    descricao: string,
+    slaPrazoMs: number,
+    antecedenciaMs: number
+  ): Promise<string | null> {
+    try {
+      const { status: existingStatus } = await Notifications.getPermissionsAsync();
+      let finalStatus = existingStatus;
+
+      if (existingStatus !== 'granted') {
+        const { status } = await Notifications.requestPermissionsAsync();
+        finalStatus = status;
+      }
+
+      if (finalStatus !== 'granted') {
+        return null;
+      }
+
+      const segundosAteAviso = Math.max(
+        5,
+        Math.round((slaPrazoMs - antecedenciaMs - Date.now()) / 1000)
+      );
+
+      const notificationId = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: '⚠️ Prazo de SLA se esgotando!',
+          body: `O chamado "${descricao.trim()}" está próximo do vencimento.`,
+          data: { chamadoId },
+          sound: 'default',
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+          seconds: segundosAteAviso,
+          repeats: false,
+          channelId: 'sla-alerts',
+        },
+      });
+
+      return notificationId;
+    } catch (error) {
+      console.log('Erro ao agendar notificação de SLA:', error);
+      return null;
+    }
+  }
+
   // Salvar no Firestore e navegar de volta
   async function handleCreateCall() {
     setSaving(true);
 
     try {
-      await addDoc(collection(db, 'alunos', ALUNO_ID, 'chamados'), {
+      const slaConfig = SLA_OPCOES[prioridade];
+      const slaPrazo = Date.now() + slaConfig.duracaoMs;
+
+      const docRef = await addDoc(collection(db, 'alunos', ALUNO_ID, 'chamados'), {
         description,
         photoUri,
         address,
         status: 'aberto',
+        prioridade,
+        slaPrazo,
         criadoEm: serverTimestamp(),
       });
 
-      Alert.alert('Sucesso', 'Chamado registrado!');
+      const notificationId = await agendarNotificacaoSla(
+        docRef.id,
+        description,
+        slaPrazo,
+        slaConfig.antecedenciaMs
+      );
+
+      if (notificationId) {
+        await updateDoc(docRef, { notificationId });
+      }
+
+      Alert.alert(
+        'Sucesso',
+        notificationId
+          ? `Chamado registrado! Você será notificado antes do vencimento (${slaConfig.detalhe}).`
+          : 'Chamado registrado!'
+      );
       setDescription('');
       setPhotoUri(null);
       setAddress(null);
+      setPrioridade('normal');
       navigation.navigate('CallList');
     } catch (error) {
       Alert.alert('Erro', 'Não foi possível salvar o chamado. Tente novamente.');
@@ -163,6 +260,27 @@ export default function NewCallScreen({ navigation }: any) {
         </TouchableOpacity>
       </View>
 
+      <Text style={styles.label}>Prioridade / Prazo de Atendimento (SLA)</Text>
+      <View style={styles.slaRow}>
+        {(Object.keys(SLA_OPCOES) as PrioridadeSla[]).map((key) => {
+          const selecionado = prioridade === key;
+          return (
+            <TouchableOpacity
+              key={key}
+              style={[styles.slaOption, selecionado && styles.slaOptionSelected]}
+              onPress={() => setPrioridade(key)}
+            >
+              <Text style={[styles.slaOptionTitle, selecionado && styles.slaOptionTitleSelected]}>
+                {SLA_OPCOES[key].label}
+              </Text>
+              <Text style={[styles.slaOptionDetail, selecionado && styles.slaOptionDetailSelected]}>
+                {SLA_OPCOES[key].detalhe}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
       <TouchableOpacity
         style={[styles.button, styles.confirmButton, (!description || saving) && styles.disabledButton]}
         disabled={!description || saving}
@@ -189,6 +307,22 @@ const styles = StyleSheet.create({
   button: { flex: 1, borderRadius: 8, padding: 14, alignItems: 'center' },
   cameraButton: { backgroundColor: '#1565c0' },
   galleryButton: { backgroundColor: '#6a1b9a' },
+  slaRow: { gap: 8 },
+  slaOption: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 8,
+    padding: 12,
+  },
+  slaOptionSelected: {
+    borderColor: '#2e7d32',
+    backgroundColor: '#e8f5e9',
+  },
+  slaOptionTitle: { fontSize: 15, fontWeight: 'bold', color: '#333' },
+  slaOptionTitleSelected: { color: '#1b5e20' },
+  slaOptionDetail: { fontSize: 12, color: '#666', marginTop: 2 },
+  slaOptionDetailSelected: { color: '#2e7d32' },
   confirmButton: { backgroundColor: '#2e7d32', marginTop: 20 },
   disabledButton: { backgroundColor: '#a5d6a7' },
   buttonText: { color: '#fff', fontWeight: 'bold' },

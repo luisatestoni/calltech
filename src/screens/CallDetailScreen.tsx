@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import * as Notifications from 'expo-notifications';
 import { doc, getDoc, updateDoc } from 'firebase/firestore';
 import { db, ALUNO_ID } from '../firebase/config';
 
@@ -8,7 +9,35 @@ type Chamado = {
   photoUri?: string | null;
   address?: string | null;
   status: string;
+  prioridade?: string;
+  slaPrazo?: number;
+  notificationId?: string | null;
 };
+
+function formatarSlaDetalhe(slaPrazo?: number, status?: string) {
+  if (!slaPrazo) return null;
+
+  const dataFormatada = new Date(slaPrazo).toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  if (status === 'concluido' || status === 'cancelado') {
+    return { texto: `Encerrado (prazo era até ${dataFormatada})`, cor: '#666' };
+  }
+
+  const restanteMs = slaPrazo - Date.now();
+  if (restanteMs <= 0) {
+    return { texto: `SLA esgotado (venceu às ${dataFormatada})`, cor: '#d32f2f' };
+  }
+
+  const min = Math.ceil(restanteMs / 60000);
+  if (min <= 15) {
+    return { texto: `Vence às ${dataFormatada} (${min} min restantes)`, cor: '#ed6c02' };
+  }
+
+  return { texto: `Vence às ${dataFormatada} (${min} min restantes)`, cor: '#2e7d32' };
+}
 
 export default function CallDetailScreen({ route }: any) {
   const { chamadoId } = route.params;
@@ -43,11 +72,31 @@ export default function CallDetailScreen({ route }: any) {
     try {
       setUpdating(true);
       const docRef = doc(db, 'alunos', ALUNO_ID, 'chamados', chamadoId);
-      
-      await updateDoc(docRef, { status: novoStatus });
-      
+      const encerrando = novoStatus === 'concluido' || novoStatus === 'cancelado';
+
+      if (encerrando && chamado?.notificationId) {
+        try {
+          await Notifications.cancelScheduledNotificationAsync(chamado.notificationId);
+        } catch (err) {
+          console.log('Aviso ao cancelar notificação:', err);
+        }
+      }
+
+      await updateDoc(docRef, {
+        status: novoStatus,
+        ...(encerrando ? { notificationId: null } : {}),
+      });
+
       // Atualiza o estado local imediatamente sem precisar recarregar tudo
-      setChamado((prev) => (prev ? { ...prev, status: novoStatus } : null));
+      setChamado((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: novoStatus,
+              ...(encerrando ? { notificationId: null } : {}),
+            }
+          : null
+      );
     } catch (error) {
       Alert.alert('Erro', 'Não foi possível atualizar o status.');
       console.log(error);
@@ -80,6 +129,24 @@ export default function CallDetailScreen({ route }: any) {
 
         <Text style={styles.label}>Status atual</Text>
         <Text style={styles.statusValue}>{chamado.status}</Text>
+
+        {chamado.prioridade && (
+          <>
+            <Text style={styles.label}>Prioridade</Text>
+            <Text style={styles.value}>{chamado.prioridade.toUpperCase()}</Text>
+          </>
+        )}
+
+        {(() => {
+          const slaInfo = formatarSlaDetalhe(chamado.slaPrazo, chamado.status);
+          if (!slaInfo) return null;
+          return (
+            <>
+              <Text style={styles.label}>Prazo de Atendimento (SLA)</Text>
+              <Text style={[styles.slaValue, { color: slaInfo.cor }]}>{slaInfo.texto}</Text>
+            </>
+          );
+        })()}
 
         {chamado.address && (
           <>
@@ -143,6 +210,7 @@ const styles = StyleSheet.create({
   label: { fontSize: 12, color: '#888', marginTop: 12, fontWeight: 'bold' },
   value: { fontSize: 16, color: '#333', marginTop: 2 },
   statusValue: { fontSize: 15, color: '#2e7d32', marginTop: 2, fontWeight: 'bold', textTransform: 'uppercase' },
+  slaValue: { fontSize: 14, marginTop: 2, fontWeight: '600' },
   image: { width: '100%', height: 200, borderRadius: 8, marginTop: 8 },
   actionsContainer: { gap: 10 },
   button: { padding: 14, borderRadius: 8, alignItems: 'center' },
